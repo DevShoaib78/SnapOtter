@@ -699,7 +699,7 @@ export function useEditorShortcuts(callbacks?: {
     { preventDefault: true },
   );
 
-  // Enter - Close an in-progress polygonal lasso, else apply current operation (crop, transform)
+  // Enter - Close an in-progress polygonal lasso, else apply the crop
   useHotkeys(
     "enter",
     (e) => {

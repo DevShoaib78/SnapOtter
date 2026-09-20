@@ -7,20 +7,13 @@ vi.mock("@/lib/analytics", async () => {
   return analyticsModuleMock();
 });
 
-// Bypass the persist middleware so the editor store starts clean per test.
-vi.mock("zustand/middleware", async (importOriginal) => {
-  const actual: Record<string, unknown> = await importOriginal();
-  return { ...actual, persist: (config: unknown) => config };
-});
-
-// Only the hook is under test; jsdom has no canvas, so Konva renders nothing.
-vi.mock("react-konva", () => new Proxy({}, { get: () => () => null }));
-
 // The shortcut hook reaches the stage through this module; the stage is not needed.
 vi.mock("@/components/editor/editor-canvas", () => ({
   editorStageRefHolder: { current: null },
 }));
 
+// Only the hook is under test. react-konva is imported for the preview components
+// but never rendered here, so the real module loads fine under jsdom.
 import {
   polygonalLassoRefHolder,
   useSelectionTool,
@@ -28,6 +21,7 @@ import {
 import { useEditorShortcuts } from "@/hooks/use-editor-shortcuts";
 import { useEditorStore } from "@/stores/editor-store";
 
+// Every test replaces the whole store from this snapshot, so nothing leaks between them.
 const INITIAL_STATE = useEditorStore.getState();
 const TRIANGLE = [10, 10, 110, 10, 60, 90];
 
@@ -50,6 +44,15 @@ function setup(zoom = 1) {
   return { result, click, dblclick, drawTriangle };
 }
 
+function setupCropOnEnter() {
+  const applyCrop = vi.fn();
+  const cropState = { x: 0, y: 0, width: 4, height: 4, aspectRatio: null };
+  useEditorStore.setState({ ...INITIAL_STATE, isCropping: true, cropState, applyCrop }, true);
+  renderHook(() => useEditorShortcuts());
+  const pressEnter = () => fireEvent.keyDown(document.body, { key: "Enter", code: "Enter" });
+  return { applyCrop, pressEnter };
+}
+
 afterEach(() => {
   cleanup();
   polygonalLassoRefHolder.current = null;
@@ -69,19 +72,32 @@ describe("polygonal lasso close gestures (#1059)", () => {
     expect(selection()).toMatchObject({ points: [10, 10, 110, 10, 12, 12, 60, 90] });
   });
 
-  it("measures the close tolerance in screen pixels, not canvas pixels", () => {
-    // Zoomed out 4x: 20 canvas px is 5 screen px, inside the 8 px target.
-    const far = setup(0.25);
-    far.drawTriangle();
-    far.click(30, 10);
-    expect(selection()?.points).toEqual(TRIANGLE);
+  it("shows the close target once three vertices exist, lit if the pointer is already on it", () => {
+    const { result, click } = setup();
+    click(10, 10);
+    click(110, 10);
+    expect(result.current.polygonCloseTarget).toBeNull();
 
-    // Zoomed in 4x: 3 canvas px is 12 screen px, outside it, so a vertex is added.
-    const near = setup(4);
-    near.drawTriangle();
-    near.click(13, 10);
+    click(12, 12); // the third vertex lands inside the target
+    expect(result.current.polygonCloseTarget).toEqual({ x: 10, y: 10, active: true });
+
+    act(() => result.current.onMouseMove({ x: 60, y: 90 }));
+    expect(result.current.polygonCloseTarget).toEqual({ x: 10, y: 10, active: false });
+  });
+
+  it("closes from 20 canvas px away when zoomed out 4x (5 screen px, inside the target)", () => {
+    const { click, drawTriangle } = setup(0.25);
+    drawTriangle();
+    click(30, 10);
+    expect(selection()?.points).toEqual(TRIANGLE);
+  });
+
+  it("adds a vertex 3 canvas px away when zoomed in 4x (12 screen px, outside the target)", () => {
+    const { result, click, drawTriangle } = setup(4);
+    drawTriangle();
+    click(13, 10);
     expect(selection()).toBeNull();
-    expect(near.result.current.currentPoints).toEqual([...TRIANGLE, 13, 10]);
+    expect(result.current.currentPoints).toEqual([...TRIANGLE, 13, 10]);
   });
 
   it("still closes on double-click, with no duplicate vertex and no stub left behind", () => {
@@ -102,12 +118,28 @@ describe("polygonal lasso close gestures (#1059)", () => {
     expect(selection()).toBeNull();
   });
 
+  it("never starts a polygon from the second press of a double-click", () => {
+    const { result } = setup();
+    act(() => result.current.onMouseDown({ x: 10, y: 10 }, undefined, 2));
+    expect(result.current.currentPoints).toEqual([]);
+    expect(selection()).toBeNull();
+  });
+
   it("closes on Enter, which reaches the tool through the shared holder", () => {
     const { drawTriangle } = setup();
     renderHook(() => useEditorShortcuts());
     drawTriangle();
     fireEvent.keyDown(document.body, { key: "Enter", code: "Enter" });
     expect(selection()?.points).toEqual(TRIANGLE);
+  });
+
+  it("discards an in-progress polygon when the tool changes", () => {
+    const { result, drawTriangle } = setup();
+    drawTriangle();
+    act(() => useEditorStore.setState({ activeTool: "brush" }));
+    expect(result.current.currentPoints).toEqual([]);
+    expect(polygonalLassoRefHolder.current?.close()).toBe(false);
+    expect(selection()).toBeNull();
   });
 
   it("leaves the freehand lasso closing on mouse-up", () => {
@@ -123,12 +155,23 @@ describe("polygonal lasso close gestures (#1059)", () => {
   });
 
   it("gives the polygon priority over the Enter crop binding", () => {
-    const applyCrop = vi.fn();
-    const cropState = { x: 0, y: 0, width: 4, height: 4, aspectRatio: null };
-    useEditorStore.setState({ ...INITIAL_STATE, isCropping: true, cropState, applyCrop }, true);
+    const { applyCrop, pressEnter } = setupCropOnEnter();
     polygonalLassoRefHolder.current = { close: () => true };
-    renderHook(() => useEditorShortcuts());
-    fireEvent.keyDown(document.body, { key: "Enter", code: "Enter" });
+    pressEnter();
     expect(applyCrop).not.toHaveBeenCalled();
+  });
+
+  it("still applies the crop on Enter when no polygon is in progress", () => {
+    const { applyCrop, pressEnter } = setupCropOnEnter();
+    polygonalLassoRefHolder.current = { close: () => false };
+    pressEnter();
+    expect(applyCrop).toHaveBeenCalledTimes(1);
+  });
+
+  it("still applies the crop on Enter when the lasso tool is not mounted", () => {
+    const { applyCrop, pressEnter } = setupCropOnEnter();
+    polygonalLassoRefHolder.current = null;
+    pressEnter();
+    expect(applyCrop).toHaveBeenCalledTimes(1);
   });
 });

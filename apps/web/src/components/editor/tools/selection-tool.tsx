@@ -251,7 +251,7 @@ export function pointInPolygon(x: number, y: number, points: number[]): boolean 
 }
 
 // ---------------------------------------------------------------------------
-// Polygonal lasso -- closing gestures
+// Polygonal lasso: closing gestures
 // ---------------------------------------------------------------------------
 
 /** Close-target radius on the first vertex, in SCREEN pixels so it stays
@@ -556,8 +556,9 @@ export function useSelectionTool(): SelectionToolApi {
         // Polygonal lasso: each click adds a vertex. The browser's click count
         // is the double-click test, not Konva's dblclick, which fires for any
         // two clicks within 400 ms even at different spots and would close on
-        // quickly placed vertices. The first press of a double-click already
-        // placed a vertex, so the second only ever closes.
+        // quickly placed vertices. The first press of a double-click already went
+        // through the single-click path, so the second never adds a vertex: it
+        // only calls closePolygon, which also drops a stub under three vertices.
         if (clickCount >= 2) {
           closePolygon();
           return;
@@ -572,10 +573,8 @@ export function useSelectionTool(): SelectionToolApi {
           return;
         }
         const verts = polyVerticesRef.current;
-        if (
-          verts.length >= POLY_MIN_CLOSE_POINTS &&
-          isNearFirstVertex(verts, pos, useEditorStore.getState().zoom)
-        ) {
+        const zoom = useEditorStore.getState().zoom;
+        if (verts.length >= POLY_MIN_CLOSE_POINTS && isNearFirstVertex(verts, pos, zoom)) {
           // Clicking the first vertex closes the polygon instead of adding a vertex
           closePolygon();
           return;
@@ -584,7 +583,12 @@ export function useSelectionTool(): SelectionToolApi {
         polyVerticesRef.current = [...verts, pos.x, pos.y];
         setCurrentPoints([...polyVerticesRef.current]);
         if (polyVerticesRef.current.length >= POLY_MIN_CLOSE_POINTS) {
-          setPolygonCloseTarget({ x: verts[0], y: verts[1], active: false });
+          // The third vertex can land inside the target, so light it up at once
+          setPolygonCloseTarget({
+            x: verts[0],
+            y: verts[1],
+            active: isNearFirstVertex(verts, pos, zoom),
+          });
         }
       } else {
         // Freehand lasso, rect, or ellipse
@@ -631,8 +635,8 @@ export function useSelectionTool(): SelectionToolApi {
     if (!isDrawingRef.current) return;
 
     if (selectionType === "lasso" && isPolyLasso()) {
-      // Polygonal lasso: mouseUp does NOT close the polygon, only dblclick does.
-      // The vertex was already added in onMouseDown, so nothing to do here.
+      // Polygonal lasso: the vertex was placed in onMouseDown, and every close
+      // gesture (Enter, double-click, first vertex) goes through closePolygon.
       return;
     }
 
